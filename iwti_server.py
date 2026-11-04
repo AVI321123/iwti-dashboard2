@@ -249,12 +249,15 @@ class Handler(SimpleHTTPRequestHandler):
             return
         # Public hosting: expose the dashboard and explicitly supported APIs only.
         # Never expose Python code, caches, deployment config, or directory indexes.
-        if path not in ('/iwti_dashboard.html', '/api/cyber', '/api/aviation', '/api/news', '/api/history', '/api/export', '/favicon.ico'):
+        if path not in ('/iwti_dashboard.html', '/api/cyber', '/api/aviation', '/api/news', '/api/history', '/api/status', '/favicon.ico'):
             self.send_error(404, 'Not Found')
             return
         if path == '/favicon.ico':
             self.send_error(404, 'Not Found')
             return
+        if path == '/api/status':
+            body=json.dumps({'service':'IWTI V6','status':'up','sources':{'cyber':'SANS DShield topports_reports','news':'Google News RSS','aviation':'Google News RSS'},'note':'Sources are retrieved on request and cached; this status does not guarantee upstream availability.'},ensure_ascii=False).encode('utf8')
+            self.send_response(200);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body);return
         if path in ('/api/news', '/api/history', '/api/export'):
             result = news_payload() if path == '/api/news' else history_payload()
             body=json.dumps(result,ensure_ascii=False).encode('utf8')
@@ -262,7 +265,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header('Content-Type','application/json; charset=utf-8')
             self.send_header('Cache-Control','no-store')
             self.send_header('X-Content-Type-Options','nosniff')
-            if path == '/api/export': self.send_header('Content-Disposition','attachment; filename=iwti_history.json')
+            
             self.send_header('Content-Length',str(len(body)))
             self.end_headers();self.wfile.write(body)
             return
