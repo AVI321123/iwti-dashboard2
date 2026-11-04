@@ -19,7 +19,7 @@ from xml.etree import ElementTree as ET
 
 ROOT = Path(__file__).resolve().parent
 HOST = os.environ.get('IWTI_HOST', '127.0.0.1')
-PORT = int(os.environ.get('IWTI_PORT', '8765'))
+PORT = int(os.environ.get('PORT', os.environ.get('IWTI_PORT', '8765')))
 FEED_URL = 'https://feeds.dshield.org/feeds/topports_reports.txt'
 MIN_INTERVAL = 3600  # SANS recommends not downloading static feeds more than once per hour.
 STATE_PATH = ROOT / 'iwti_free_cache.json'
@@ -139,6 +139,7 @@ def refresh_aviation():
 
 def aviation_payload():
     cache = refresh_aviation()
+    if cache.get('items'): record_snapshot(aviation_count=len(cache['items']))
     items = cache.get('items', [])
     return {
         'source': 'Google News RSS • published civil aviation disruption reports',
@@ -157,12 +158,115 @@ def aviation_payload():
         ]
     }
 
+
+# Public news monitoring. We do not infer operational actions or assign probabilities to war.
+import sqlite3
+from email.utils import parsedate_to_datetime
+NEWS_INTERVAL = 1800
+NEWS_QUERIES = {
+ 'מתיחות אזורית': 'Israel regional tensions diplomacy',
+ 'הצהרות רשמיות': 'Israel Iran official statements diplomacy',
+ 'משבר אזורי': 'Middle East conflict ceasefire negotiations',
+}
+NEWS_CACHE_PATH = ROOT / 'iwti_news_cache.json'
+DATA_DIR = Path(os.environ.get('IWTI_DATA_DIR', str(ROOT)))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / 'iwti_history.sqlite3'
+NEWS_LOCK = threading.Lock()
+
+def db_init():
+    with sqlite3.connect(DB_PATH, timeout=8) as db:
+        db.execute('CREATE TABLE IF NOT EXISTS samples (sample_at TEXT PRIMARY KEY, news_count INTEGER, publishers INTEGER, cyber_count INTEGER, aviation_count INTEGER)')
+
+def record_snapshot(news_count=None, publishers=None, cyber_count=None, aviation_count=None):
+    # Bucket hourly for fair comparisons; don't count page views as samples.
+    key = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:00:00Z')
+    try:
+        with sqlite3.connect(DB_PATH, timeout=8) as db:
+            db.execute('INSERT OR IGNORE INTO samples(sample_at,news_count,publishers,cyber_count,aviation_count) VALUES (?,?,?,?,?)', (key,None,None,None,None))
+            db.execute('UPDATE samples SET news_count=COALESCE(?,news_count), publishers=COALESCE(?,publishers), cyber_count=COALESCE(?,cyber_count), aviation_count=COALESCE(?,aviation_count) WHERE sample_at=?', (news_count,publishers,cyber_count,aviation_count,key))
+            db.execute("DELETE FROM samples WHERE sample_at < strftime('%Y-%m-%dT%H:00:00Z','now','-365 days')")
+    except (sqlite3.Error, OSError):
+        pass
+
+def history_payload():
+    try:
+        with sqlite3.connect(DB_PATH, timeout=8) as db:
+            rows=db.execute('SELECT sample_at, news_count, publishers, cyber_count, aviation_count FROM samples ORDER BY sample_at DESC LIMIT 1000').fetchall()
+        return {'samples':[dict(zip(('sample_at','news_count','publishers','cyber_count','aviation_count'),row)) for row in rows], 'durable': bool(os.environ.get('IWTI_DATA_DIR')), 'note':'Sampling history is not training labels or calibrated AI forecasts. Render Free local filesystem is ephemeral.'}
+    except sqlite3.Error as e:
+        return {'samples':[], 'error':str(e)[:150]}
+
+def news_payload():
+    with NEWS_LOCK:
+        try: cached=json.loads(NEWS_CACHE_PATH.read_text(encoding='utf8'))
+        except (OSError,ValueError): cached={}
+        now=time.time()
+        if now - float(cached.get('last_attempt',0)) >= NEWS_INTERVAL:
+            cached['last_attempt']=now
+            articles=[];errs=[]
+            for topic,q in NEWS_QUERIES.items():
+                u='https://news.google.com/rss/search?q='+quote(q+' when:7d')+'&hl=en&gl=US&ceid=US:en'
+                try:
+                    req=Request(u,headers={'User-Agent':'Mozilla/5.0 (IWTI public RSS monitor)'})
+                    with urlopen(req,timeout=12) as r: xml=r.read(450000)
+                    root=ET.fromstring(xml)
+                    for it in root.findall('./channel/item')[:40]:
+                        title=(it.findtext('title') or '').strip(); link=(it.findtext('link') or '').strip()
+                        if not title or not link.startswith('https://'):continue
+                        pub=it.find('source')
+                        publisher=(pub.text or '').strip() if pub is not None and pub.text else 'לא מזוהה'
+                        articles.append({'title':title[:240], 'url':link, 'publisher':publisher[:90], 'published':(it.findtext('pubDate') or '')[:80], 'topic':topic})
+                except (OSError,ValueError,ET.ParseError) as e:errs.append(type(e).__name__)
+            seen=set();uni=[]
+            for it in articles:
+                norm=re.sub(r'\s+',' ',it['title'].casefold()).strip()
+                if norm not in seen:seen.add(norm);uni.append(it)
+            if uni:
+                cached.update(items=uni[:120],source_updated_at=datetime.now(timezone.utc).isoformat(),error=None)
+            else: cached['error']='; '.join(errs) or 'No RSS items returned'
+            try:NEWS_CACHE_PATH.write_text(json.dumps(cached,ensure_ascii=False),encoding='utf8')
+            except OSError:pass
+        items=cached.get('items',[])
+        pubs=len({i.get('publisher') for i in items if i.get('publisher')!='לא מזוהה'})
+        if items:record_snapshot(news_count=len(items),publishers=pubs)
+        return {'source':'Google News RSS public aggregator', 'source_updated_at':cached.get('source_updated_at'), 'refresh_interval_seconds':NEWS_INTERVAL,'count_7d':len(items),'publisher_count':pubs,'items':items[:50],'stale':bool(cached.get('error')),'error':cached.get('error'),'metric':'sampled_unique_news_headlines_in_search_last_7_days','note':'Number of articles is not the probability of war or independent verification; coverage incomplete and potentially biased.'}
+
+db_init()
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
     def do_GET(self):
-        if self.path.split('?', 1)[0] == '/api/aviation':
+        from urllib.parse import urlsplit, unquote
+        path = unquote(urlsplit(self.path).path)
+        if path in ('/', '/index.html'):
+            self.send_response(302)
+            self.send_header('Location', '/iwti_dashboard.html')
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            return
+        # Public hosting: expose the dashboard and explicitly supported APIs only.
+        # Never expose Python code, caches, deployment config, or directory indexes.
+        if path not in ('/iwti_dashboard.html', '/api/cyber', '/api/aviation', '/api/news', '/api/history', '/api/export', '/favicon.ico'):
+            self.send_error(404, 'Not Found')
+            return
+        if path == '/favicon.ico':
+            self.send_error(404, 'Not Found')
+            return
+        if path in ('/api/news', '/api/history', '/api/export'):
+            result = news_payload() if path == '/api/news' else history_payload()
+            body=json.dumps(result,ensure_ascii=False).encode('utf8')
+            self.send_response(200)
+            self.send_header('Content-Type','application/json; charset=utf-8')
+            self.send_header('Cache-Control','no-store')
+            self.send_header('X-Content-Type-Options','nosniff')
+            if path == '/api/export': self.send_header('Content-Disposition','attachment; filename=iwti_history.json')
+            self.send_header('Content-Length',str(len(body)))
+            self.end_headers();self.wfile.write(body)
+            return
+        if path == '/api/aviation':
             body=json.dumps(aviation_payload(),ensure_ascii=False).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type','application/json; charset=utf-8')
@@ -171,10 +275,11 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if self.path.split('?', 1)[0] != '/api/cyber':
+        if path != '/api/cyber':
             return super().do_GET()
         cache = refresh()
         ports = cache.get('ports', [])
+        if ports: record_snapshot(cyber_count=sum(x['observations'] for x in ports))
         if ports:
             result = {
                 'source': 'SANS ISC / DShield — Top Ports by Reports',
@@ -203,7 +308,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 if __name__ == '__main__':
-    print('IWTI FREE V3 — no token, no packages; aviation news hourly')
+    print('IWTI V4 LIVE — news every 30 min, aviation and cyber hourly')
     print(f'Open http://{HOST}:{PORT}/iwti_dashboard.html')
     print('Feed credited to SANS Technology Institute / Internet Storm Center')
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
